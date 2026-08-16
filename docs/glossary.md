@@ -902,7 +902,7 @@ throw new DataCorruptedError(
 **計算方法**:
 
 ```
-集約キー = `${entry.projectId} ${entry.taskId}`
+集約キー = `${entry.projectId}:${entry.taskId}`
 ```
 
 **名前ではなく[内部ID](#内部id)で束ねる**。名前で集約すると、リネーム前後のエントリや、

@@ -325,7 +325,7 @@ const tmp = `${target}.tmp.${process.pid}`;
 
 // ✅ 良い例: 集約キーの選択理由
 // 名前ではなく ID で束ねる。リネーム前後のエントリが別行に割れるのを防ぐ
-const key = `${entry.projectId} ${entry.taskId}`;
+const key = `${entry.projectId}:${entry.taskId}`;
 
 // ❌ 悪い例: コードを読めば分かること
 // tmp に書き込む

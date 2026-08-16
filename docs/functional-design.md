@@ -699,7 +699,7 @@ function summarize(entries: Entry[], resolver: NameResolver): DailyReport {
   // プロジェクトID + タスクID をキーに集約する(名前ではなくIDで束ねる)
   const map = new Map<string, Subtotal>();
   for (const row of rows) {
-    const key = `${row.entry.projectId} ${row.entry.taskId}`;
+    const key = `${row.entry.projectId}:${row.entry.taskId}`;
     const found = map.get(key);
     if (found) found.minutes += row.entry.minutes;
     else map.set(key, {
