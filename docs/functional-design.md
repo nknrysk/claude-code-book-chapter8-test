@@ -26,10 +26,19 @@ graph TB
         NR[NameResolver<br/>ID→現在名の解決]
     end
 
+    subgraph 純粋ロジックレイヤー
+        Split[splitByDay / buildEntries<br/>日跨ぎ分割]
+        Resolve[resolveTask / byRecency<br/>タスク解決・整列]
+        IdGen[generateId<br/>ID採番]
+        Sum[summarize<br/>日次集計]
+        Csv[toCsv<br/>CSV生成・エスケープ - P1]
+    end
+
     subgraph データレイヤー
         PStore[ProjectStore<br/>projects.json]
         EStore[EntryStore<br/>entries/YYYY-MM.jsonl]
         CStore[CurrentStore<br/>current.json]
+        RStore[RecoveryLogStore<br/>recovery.jsonl]
         AW[atomicWrite<br/>一時ファイル+rename]
     end
 
@@ -46,24 +55,37 @@ graph TB
     Handlers --> ES
     Prompt --> TS
     TS --> PS
+    TS --> Split
+    PS --> Resolve
+    PS --> IdGen
+    RS --> Sum
     RS --> NR
     ES --> NR
+    ES --> Csv
     NR --> PS
     PS --> PStore
     TS --> EStore
     TS --> CStore
     RS --> EStore
     ES --> EStore
+    TS --> RStore
     PStore --> AW
     EStore --> AW
     CStore --> AW
     AW --> FS
     EStore --> FS
+    RStore --> FS
 ```
 
-**レイヤーの依存方向は一方向**（REPL → サービス → データ）。サービスレイヤーは
+**レイヤーの依存方向は一方向**（REPL → サービス → 純粋ロジック / データ）。サービスレイヤーは
 `console` や `readline` に依存せず、戻り値として結果オブジェクトを返す。
 これにより、サービス層は REPL を起動せずに単体テストできる。
+
+`splitByDay`・`resolveTask`・`byRecency`・`generateId`・`summarize`・`toCsv` などの
+副作用を持たない計算は純粋ロジックレイヤー（`src/domain/`）に切り出し、サービスレイヤーが
+これを呼び出す。純粋ロジックはファイルI/O・現在時刻取得・コンソール出力を一切行わないため、
+ファイルシステムや時刻のモックなしに単体テストできる（配置は `docs/repository-structure.md` の
+`src/domain/` を参照）。
 
 ## 技術スタック
 
@@ -77,6 +99,10 @@ graph TB
 | ID採番 | `node:crypto` + Crockford Base32 | 依存追加なしで衝突しない短いIDを生成できる |
 | テスト | Vitest 2.x | 既存構成をそのまま使用 |
 | 静的解析 | ESLint 9 + Prettier 3 | 既存構成をそのまま使用 |
+
+> **Node.js のバージョン表記について**: `CLAUDE.md` には v24.11.0 と記載があるが、devcontainer の
+> 実測は v24.19.0（`docs/architecture.md` を参照）。いずれも v24 系のため本設計に影響はない。
+> `package.json` の `engines` には `">=24.0.0"` を指定する。
 
 **外部依存を追加しない方針**とする。カラー出力も ANSI エスケープを直接扱う薄いラッパで済ませる。
 
@@ -146,6 +172,9 @@ interface Entry {
   taskId: TaskId;          // 参照の正
   taskName: string;        // 記録時点のスナップショット
   note?: string;           // 備考。設定された場合のみ存在する
+  source: 'realtime' | 'manual';  // 作成経路。start/stop 由来は 'realtime'、
+                                  // add/edit(P1) 由来は 'manual'。
+                                  // PRD の KPI「事後修正率」の集計に用いる
 }
 ```
 
@@ -154,6 +183,7 @@ interface Entry {
 - `date` は `start` から導出され、日跨ぎ分割後は各セグメントの開始日と一致する
 - `minutes` は「分に切り捨てた開始時刻」と「分に切り捨てた終了時刻」の差から算出する（後述の[作業時間の算出と日跨ぎ分割](#アルゴリズム設計)を参照）
 - `note` は空文字列では保存しない。未設定の場合はキー自体を持たない
+- `source` は `start` / `stop`（起動時の復帰による確定を含む）で生成された場合は `'realtime'`、`add` / `edit`（P1）で生成・書き換えされた場合は `'manual'` を設定する。P0 の段階から付与しておくことで、P1 導入後に KPI「事後修正率」の分母（全エントリ）を P0 期間まで遡って集計できる。後から追加すると P0 期間のエントリが経路不明となり、遡及集計が不可能になる
 - **ID と名前を併せ持つ**。ID は参照の正、名前は `projects.json` を失った場合のフォールバックかつ JSONL 単体での可読性の担保
 
 ### エンティティ: CurrentTimer（計測中の状態）
@@ -221,6 +251,7 @@ erDiagram
         string taskId FK
         string taskName "snapshot"
         string note "nullable"
+        string source "realtime | manual"
     }
     CURRENT_TIMER {
         string projectId FK
@@ -259,7 +290,10 @@ class ReplSession {
   /** 起動から終了までを実行する */
   run(): Promise<void>;
 
-  /** 起動時の復帰フロー。current.json があれば終了時刻を尋ねて確定する */
+  /**
+   * 起動時の復帰フロー。current.json があれば終了時刻を尋ねて確定する。
+   * 突入時点で TimerService.recordRecoveryStarted() を呼び、発火を1件記録する
+   */
   private recoverIfNeeded(): Promise<void>;
 
   /** 終了要求の処理。計測中なら false を返してループを継続する */
@@ -297,6 +331,7 @@ class PromptRenderer {
 **設計上の要点**:
 
 - 経過時間はコマンド確定のたびに `now` から再計算する。タイマーによる定期再描画は行わない（PRD の要件は「実際の経過時間との誤差 1 分以内」であり、再描画のたびに正確な値になれば満たせる）
+- **これはアイドル時 CPU 0% とのトレードオフである**。REPL に常駐させる利用形態では、何も入力せずに放置している間、プロンプトには最後にコマンドを実行した時点の経過時間が表示され続ける。定期再描画を行えば表示は常に最新になるが、常駐プロセスが 1 分ごとに起床することになり、「起動しっぱなしにしても邪魔にならない」という PRD のコンセプトと引き換えになる。**表示の鮮度より常駐コストを優先する**という判断であり、要件上の誤差 1 分以内は「利用者が経過時間を読むのはコマンドを打った直後である」という前提のもとで満たされる
 - `HH:MM` 形式は 100 時間以上でも桁を伸ばす（`String(hours).padStart(2, '0')` により `100:00` となる）
 - `now` を引数で受け取り、テスト時に時刻を固定できるようにする
 
@@ -331,6 +366,53 @@ class CommandRouter {
 - `start <番号|名前> [備考]` の備考は、第 2 トークン以降を空白を保ったまま連結した `rest` を用いる
 - `--` で始まるトークンはフラグとして抽出し、位置引数から除外する
 
+### HelpHandler（REPL レイヤー）
+
+**責務**:
+
+- `help` 実行時、全コマンドの一覧と 1 行説明を表示する
+- `help <コマンド名>` 実行時、該当コマンドの引数説明と使用例を表示する
+- 未知のコマンド入力時、`CommandRouter` から参照され、エラーメッセージに `help` の案内を付与する（[エラーハンドリング](#エラーハンドリング)の「未知のコマンド」はこの経路で表示する）
+
+**インターフェース**:
+
+```typescript
+interface CommandSpec {
+  name: string;             // "start" | "project" | ...
+  sub?: string;             // "add" | "list" | "archive"（project / task のみ）
+  summary: string;          // 1行説明。help の一覧表示に使う
+  usage: string;            // "start <番号|名前> [備考]" 形式
+  examples: string[];       // help <コマンド名> で表示する使用例
+}
+
+/**
+ * CommandRouter が dispatch 可能な全コマンドの静的定義。
+ * コマンド一覧の唯一の情報源とする
+ */
+const COMMAND_SPECS: CommandSpec[] = [
+  { name: 'project', sub: 'add', summary: 'プロジェクトを登録する', usage: 'project add <名前>', examples: ['project add myproj'] },
+  { name: 'use', summary: '作業対象プロジェクトを切り替える', usage: 'use <プロジェクト>', examples: ['use myproj'] },
+  { name: 'start', summary: '計測を開始する', usage: 'start <番号|名前> [備考]', examples: ['start 1', 'start 認証API 実装続き'] },
+  { name: 'stop', summary: '計測を終了してエントリを確定する', usage: 'stop', examples: ['stop'] },
+  { name: 'show', summary: '1日の作業実績とタスク別小計を表示する', usage: 'show [YYYY-MM-DD]', examples: ['show', 'show 2026-08-12'] },
+  // ... 以下、PRD のコマンド体系に定義された全コマンドを列挙する
+];
+
+class HelpHandler {
+  /** help: 全コマンドの一覧と1行説明を返す */
+  listAll(): string;
+
+  /** help <コマンド名>: 該当コマンドの詳細を返す。未知の名前は NotFound を返す */
+  describe(commandName: string): Result<string, { kind: 'NotFound'; input: string }>;
+}
+```
+
+**設計上の要点**:
+
+- `COMMAND_SPECS` は `CommandRouter` のディスパッチテーブルと同一のソースファイルで管理し、そこから両者を導出する。説明文とディスパッチ先を別々に持つと、コマンド追加時に `help` の更新漏れが生じ、PRD の受け入れ条件「`help` のみで全コマンドの仕様を確認でき、外部ドキュメントを参照する必要がない」を満たせなくなる
+- `describe` は例外を投げず `Result` で失敗を返す。他のハンドラと同じエラー表現に揃え、REPL のループを中断させない
+- `sub` を持つコマンド（`project` / `task`）は、`help project` でサブコマンドをまとめて表示する
+
 ### ProjectService（サービスレイヤー）
 
 **責務**:
@@ -347,7 +429,7 @@ class ProjectService {
   addProject(name: string): Promise<Result<Project>>;
   listProjects(includeArchived: boolean): Promise<Project[]>;
   archiveProject(name: string): Promise<Result<Project>>;
-  findProjectById(id: ProjectId): Promise<Project | null>;
+  findProjectById(projectId: ProjectId): Promise<Project | null>;
   findProjectByName(name: string): Promise<Project | null>;
 
   addTask(projectId: ProjectId, name: string): Promise<Result<Task>>;
@@ -380,6 +462,7 @@ type ResolveError =
 - 計測の開始・終了・再開・備考設定
 - 日跨ぎ分割の適用とエントリ生成
 - `current.json` のライフサイクル管理
+- 復帰導線の発火記録（KPI 測定用。`current.json` のライフサイクルに付随する事象のため、本サービスが担う）
 
 **インターフェース**:
 
@@ -394,7 +477,11 @@ class TimerService {
   /** 計測を終了し、日跨ぎ分割後のエントリ群を返す */
   stop(now: Date): Promise<Result<Entry[]>>;
 
-  /** 直前に確定したエントリと同じタスクで開始する */
+  /**
+   * 直前に確定したエントリと同じタスクで開始する。
+   * 引き継ぐのはタスクのみで、**備考は引き継がない**（同じ作業の続きでも
+   * 内容は変わるため。必要なら `note` で改めて設定する）
+   */
   resume(now: Date): Promise<Result<CurrentTimer>>;
 
   /** 計測中エントリの備考を上書きする */
@@ -402,10 +489,60 @@ class TimerService {
 
   /** 復帰フロー用。指定した終了時刻で計測を確定する */
   finalizeRecovered(end: Date): Promise<Result<Entry[]>>;
+
+  /**
+   * 復帰フロー用。復帰導線が発火したことを記録する(KPI 測定)。
+   * 確定の成否に関わらず、フロー突入時に1度だけ呼ぶ
+   */
+  recordRecoveryStarted(now: Date): Promise<void>;
+
+  // --- 以下 P1 ---
+
+  /**
+   * 事後入力。計測を経ずにエントリを直接作成する。
+   * 日跨ぎ分割は buildEntries を source='manual' で再利用する
+   */
+  add(params: AddParams): Promise<Result<{ entries: Entry[]; warnings: string[] }>>;
+
+  /**
+   * 事後修正の対象を取得する。実行前の確認表示に用いる
+   * (PRD: 修正実行前に対象エントリの現在の内容を表示して確認を求める)
+   */
+  findForEdit(date: DateString, lineNo: number): Promise<Result<Entry>>;
+
+  /**
+   * 事後修正。指定日の表示連番で対象を特定し、1 フィールドを書き換える。
+   * 該当月の全置換(EntryStore.rewriteMonth)を伴うため、
+   * 戻り値は書き換え後の「当日の」エントリ群とする
+   */
+  edit(date: DateString, lineNo: number, field: EditableField, value: string)
+    : Promise<Result<{ entries: Entry[]; warnings: string[] }>>;
 }
+
+/** add の入力。date 省略時は start の日付を用いる */
+interface AddParams {
+  date?: DateString;
+  start: IsoDateTime;
+  end: IsoDateTime;
+  projectId: ProjectId;
+  taskId: TaskId;
+  note?: string;
+}
+
+/** edit で書き換え可能なフィールド。`task` は同一プロジェクト内のタスク付け替え */
+type EditableField = 'start' | 'end' | 'task' | 'note';
 ```
 
-**依存関係**: `CurrentStore`、`EntryStore`、`ProjectService`
+**`add` / `edit` の設計上の要点**:
+
+- `add` / `edit` で生成・書き換えするエントリは `source: 'manual'` とする。KPI「事後修正率」の集計対象になる（[Entry の制約](#エンティティ-entry実績エントリ)を参照）
+- 時間帯が既存エントリと重なる場合も**中断せず実行**し、`warnings` に載せて呼び出し側に警告表示させる。会議中に別作業をしていた等、重複が実態として正しいケースがあるため
+- `lineNo` は `show` が表示する表示連番であり、ファイル上の行番号ではない。利用者が画面で見た番号をそのまま打てるようにする。**対象日の既定値は「直前に `show` で表示した日付」**（未実行なら当日）であり、この状態は REPL レイヤーが保持してサービスには解決済みの `date` を渡す
+- `field` に `task` を指定した場合、同一プロジェクト内でのみ付け替える。付け替え時は `projectId` / `taskId` と、スナップショットである `projectName` / `taskName` を必ず同時に書き換える。片方だけの更新は[エントリの ID と名前の二重保持](#エンティティ-entry実績エントリ)を静かに壊す
+- `start` / `end` の修正で日付をまたぐことになった場合、`buildEntries` による日跨ぎ分割を再適用する。この場合 1 件のエントリが複数件に増えるため、`edit` の戻り値は単一エントリではなくエントリ群とする
+- 本プロダクトは**エントリの削除コマンドを持たない**（PRD のスコープ外判断）。誤記録の是正はすべて `edit` による書き換えで行う
+
+**依存関係**: `CurrentStore`、`EntryStore`、`RecoveryLogStore`、`ProjectService`
 
 ### ReportService（サービスレイヤー）
 
@@ -480,6 +617,26 @@ class ExportService {
 }
 ```
 
+### 純粋ロジックレイヤー (domain)
+
+**責務**: 副作用（ファイルI/O・現在時刻の取得・コンソール出力）を持たない計算のみを行う。
+サービスレイヤーから呼び出される。
+
+| 関数 | 役割 | 呼び出し元 |
+|------|------|-----------|
+| `splitByDay` / `buildEntries` / `truncateToMinute` | 日跨ぎ分割と Entry の生成（分切り捨てを含む） | `TimerService` |
+| `resolveTask` / `byRecency` | 番号・名前部分一致によるタスク解決、「最近使った順」の整列 | `ProjectService` |
+| `generateId` | Crockford Base32 による不変IDの採番 | `ProjectService` |
+| `summarize` | 日次集計（行番号付与・タスク別小計） | `ReportService` |
+| `toCsv`（P1） | CSV 文字列の生成と RFC 4180 準拠のエスケープ | `ExportService` |
+
+**依存関係**: `types/` のみ。`stores/`・`services/`・`repl/` への依存は禁止する。
+
+**設計上の要点**:
+
+- 現在時刻は引数として受け取る。`Date.now()` を内部で呼ばないため、時刻のモックなしに単体テストできる
+- 各ファイルは 1 エクスポート関数を原則とする（配置とファイル名は `docs/repository-structure.md` の `src/domain/` を正とする）
+
 ### データレイヤー
 
 ```typescript
@@ -506,9 +663,27 @@ class EntryStore {
   rewriteMonth(month: MonthKey, entries: Entry[]): Promise<void>;
 }
 
+/** 復帰処理の発動記録。作業内容(タスク名・備考・プロジェクト名)は一切含まない */
+interface RecoveryEvent {
+  at: IsoDateTime;   // 復帰処理が発動した日時のみ
+}
+
+class RecoveryLogStore {
+  /** 起動時、current.json が存在し復帰フローに入った時点で1行追記する */
+  append(event: RecoveryEvent): Promise<void>;
+  /** 月次集計用。指定月の発生回数を数える */
+  countInMonth(month: MonthKey): Promise<number>;
+}
+
 /** 一時ファイルへ書き出してから rename する。処理中の異常終了でも既存ファイルが壊れない */
 function atomicWrite(path: string, content: string, mode: number): Promise<void>;
 ```
+
+**`RecoveryLogStore` の設計上の要点**:
+
+- PRD の KPI「復帰導線の発火率（月 1 回以下）」を測定するための記録である。`architecture.md` のログ非出力方針は「作業内容（タスク名・備考）を含むため」を理由とするものであり、タイムスタンプのみを持つこの記録は対象外とする。**将来もフィールドを増やさない**こと。増やした時点でこの前提が崩れる
+- 記録するのは復帰フローに**突入した時点**であり、ユーザーが確定をキャンセルした場合も 1 件として数える。KPI が測るのは確定の成否ではなく異常終了の頻度であるため
+- `append` の失敗は復帰フローを中断させない。KPI 計測用の副次的な記録が、ユーザーのデータ確定を妨げてはならない
 
 **`append` が追記（`appendFile`）を使う理由**: `stop` は最も頻度が高く、かつ最も失ってはいけない操作である。
 追記は既存の行に一切触れないため、途中で中断しても過去のエントリを破壊しない。
@@ -581,7 +756,8 @@ function startOfNextDay(d: Date): Date {
 
 ```typescript
 function buildEntries(
-  rawStart: Date, rawEnd: Date, timer: CurrentTimer
+  rawStart: Date, rawEnd: Date, timer: CurrentTimer,
+  source: Entry['source'] = 'realtime',   // add(P1) は 'manual' を渡して再利用する
 ): Entry[] {
   const start = truncateToMinute(rawStart);
   const end = truncateToMinute(rawEnd);
@@ -596,6 +772,7 @@ function buildEntries(
     taskId: timer.taskId,
     taskName: timer.taskName,
     ...(timer.note ? { note: timer.note } : {}),
+    source,
   }));
 }
 ```
@@ -809,6 +986,7 @@ sequenceDiagram
     participant Session as ReplSession
     participant CS as CurrentStore
     participant TS as TimerService
+    participant RL as RecoveryLogStore
 
     Session->>CS: load()
 
@@ -822,6 +1000,9 @@ sequenceDiagram
         Session->>CS: clear()
     else 計測中の状態あり
         CS-->>Session: CurrentTimer(start=08/11 18:00)
+        Session->>TS: recordRecoveryStarted(now)
+        TS->>RL: append({ at: now })
+        Note over Session,RL: 復帰フロー突入時点で記録する<br/>(中断された場合も1件として数える)
         Session-->>User: 計測中のまま終了していました<br/>認証API実装 開始: 08/11 18:00<br/>終了時刻を入力してください (HH:MM または YYYY-MM-DD HH:MM):
         User-->>Session: 2026-08-11 19:30
 
@@ -975,6 +1156,7 @@ ANSI エスケープを直接使用し、`process.stdout.isTTY` が false の場
 ~/.timelog/                 # パーミッション 700
 ├── projects.json           # プロジェクト/タスクのマスタ (600)
 ├── current.json            # 計測中の状態。存在しない = 計測していない (600)
+├── recovery.jsonl          # 復帰処理の発動記録。タイムスタンプのみ (600)
 └── entries/                # (700)
     ├── 2026-07.jsonl       # 月別・1行1エントリ (600)
     └── 2026-08.jsonl
@@ -1015,8 +1197,8 @@ ANSI エスケープを直接使用し、`process.stdout.isTTY` が false の場
 **entries/2026-08.jsonl の例**（1 行 1 エントリ・整形なし）:
 
 ```jsonl
-{"date":"2026-08-12","start":"2026-08-12T09:12:00+09:00","end":"2026-08-12T10:17:00+09:00","minutes":65,"projectId":"p_3x8q1v","projectName":"myproj","taskId":"t_7h2k9m","taskName":"認証API実装","note":"リフレッシュトークンの設計も含む"}
-{"date":"2026-08-12","start":"2026-08-12T10:30:00+09:00","end":"2026-08-12T11:00:00+09:00","minutes":30,"projectId":"p_3x8q1v","projectName":"myproj","taskId":"t_2p4n8s","taskName":"定例MTG"}
+{"date":"2026-08-12","start":"2026-08-12T09:12:00+09:00","end":"2026-08-12T10:17:00+09:00","minutes":65,"projectId":"p_3x8q1v","projectName":"myproj","taskId":"t_7h2k9m","taskName":"認証API実装","note":"リフレッシュトークンの設計も含む","source":"realtime"}
+{"date":"2026-08-12","start":"2026-08-12T10:30:00+09:00","end":"2026-08-12T11:00:00+09:00","minutes":30,"projectId":"p_3x8q1v","projectName":"myproj","taskId":"t_2p4n8s","taskName":"定例MTG","source":"realtime"}
 ```
 
 **current.json の例**:
@@ -1031,6 +1213,13 @@ ANSI エスケープを直接使用し、`process.stdout.isTTY` が false の場
   "start": "2026-08-12T09:12:00+09:00",
   "note": "リフレッシュトークンの設計も含む"
 }
+```
+
+**recovery.jsonl の例**（1 行 1 イベント。作業内容は含まない）:
+
+```jsonl
+{"at":"2026-08-13T09:02:00+09:00"}
+{"at":"2026-09-04T08:47:00+09:00"}
 ```
 
 ## パフォーマンス最適化
@@ -1062,34 +1251,42 @@ ANSI エスケープを直接使用し、`process.stdout.isTTY` が false の場
 サービスレイヤーは例外を投げず、`Result<T, E>` を返す。REPL レイヤーがそれを表示に変換する。
 **すべてのエラーメッセージは「何が問題か」と「次に何をすべきか」の両方を含む**（PRD の非機能要件）。
 
-| エラー種別 | 発生条件 | 処理 | ユーザーへの表示 |
-|-----------|---------|------|-----------------|
-| プロジェクト未選択 | `task add` / `start` 実行時に `currentProjectId` が null | 中断 | `プロジェクトが選択されていません。'use <プロジェクト名>' で選択してください` |
-| プロジェクト不明 | `use` に未登録の名前 | 中断・一覧を併記 | `プロジェクト 'foo' は登録されていません。登録済み: myproj, otherproj` |
-| 名前の重複 | `project add` / `task add` に既存名 | 中断 | `タスク '認証API実装' は既に登録されています。'task list' で確認してください` |
-| 連番が範囲外 | `start 99`（タスクが 3 件） | 中断 | `番号 99 は範囲外です。1〜3 の番号か、タスク名の一部を指定してください` |
-| 該当タスクなし | 部分一致 0 件 | 中断 | `'認証' に一致するタスクがありません。'task list' で一覧を確認してください` |
-| 候補が複数 | 部分一致 2 件以上 | 中断・候補を番号付きで提示 | `'API' に複数のタスクが一致します:\n  1 認証API実装\n  4 API仕様レビュー\n番号で指定してください` |
-| 計測していない | `stop` / `note` を非計測時に実行 | 中断・状態を変えない | `計測していません。'start <番号\|名前>' で開始してください` |
-| resume 対象なし | 確定エントリが 1 件も存在しない | 中断 | `再開できるエントリがありません。'start <番号\|名前>' で開始してください` |
-| 計測中の終了要求 | `exit` / Ctrl-D を計測中に実行 | **終了を中止**しループ継続 | `認証API実装 を計測中です。'stop' で終了してから exit してください` |
-| 計測中タスクのアーカイブ | `task archive` の対象が計測中 | 中断 | `計測中のタスクはアーカイブできません。'stop' してから実行してください` |
-| 時刻の前後関係が不正 | `add` / `edit` / 復帰入力で 終了 < 開始 | 中断・再入力を促す | `終了時刻(09:00)が開始時刻(10:00)より前です。開始時刻より後の時刻を指定してください` |
-| 時間帯の重複 | `add` の時間帯が既存エントリと重なる | **警告のうえ実行** | `警告: 10:00-11:00 は既存エントリ(定例MTG)と重複しています。追加しました` |
-| JSONL の行破損 | 読み込み時に JSON パース失敗 | **該当行のみスキップ**して継続 | `警告: 2026-08.jsonl の 12 行目を読み飛ばしました(不正なJSON)` |
-| マスタ解決失敗 | エントリの ID に対応するマスタがない | スナップショット名で表示・継続 | `警告: 一部のエントリでプロジェクト/タスクが見つかりません。記録時の名前で表示しています` |
-| current.json 破損 | 起動時のパース失敗 | 内容提示・破棄を確認 | `current.json が破損しています。内容: ... 破棄して起動しますか? (y/N)` |
-| projects.json 破損 | 起動時のパース失敗 | **起動を中止** | `projects.json が破損しています。~/.timelog/projects.json を修正するか、退避してから再起動してください` |
-| 出力先が存在しない | `export --out` の親ディレクトリがない | 中断 | `出力先ディレクトリ '/foo/bar' が存在しません。作成してから再実行してください` |
-| 出力先が既存 | `export` 先のファイルが既に存在 | 上書き確認 | `timelog-2026-08.csv は既に存在します。上書きしますか? (y/N)` |
-| 未知のコマンド | ルーティング失敗 | 中断 | `不明なコマンドです: 'strat'。'help' でコマンド一覧を確認できます` |
-| 予期しない例外 | 上記以外 | **ループを継続**しスタックを表示 | `予期しないエラーが発生しました: <message>\n記録は保存されています。続行できます` |
+`kind` 列は `AppError` の判別可能ユニオンのタグ（`glossary.md` の [AppError](glossary.md) と 1 対 1 で対応）。
+`—` の行は `AppError` ではなく、警告・確認・REPL レイヤーの制御・ストア層の例外として扱う。
+
+| エラー種別 | `kind` | 発生条件 | 処理 | ユーザーへの表示 |
+|-----------|--------|---------|------|-----------------|
+| プロジェクト未選択 | `NoProjectSelected` | `task add` / `start` 実行時に `currentProjectId` が null | 中断 | `プロジェクトが選択されていません。'use <プロジェクト名>' で選択してください` |
+| プロジェクト不明 | `ProjectNotFound` | `use` に未登録の名前 | 中断・一覧を併記 | `プロジェクト 'foo' は登録されていません。登録済み: myproj, otherproj` |
+| 名前の重複 | `DuplicateName` | `project add` / `task add` に既存名 | 中断 | `タスク '認証API実装' は既に登録されています。'task list' で確認してください` |
+| 名前が不正 | `InvalidName` | `project add` / `task add` の名前が 1〜100 文字の範囲外、または制御文字を含む | 中断 | `タスク名は 1〜100 文字で指定してください` |
+| 連番が範囲外 | `IndexOutOfRange` | `start 99`（タスクが 3 件） | 中断 | `番号 99 は範囲外です。1〜3 の番号か、タスク名の一部を指定してください` |
+| 該当タスクなし | `NotFound` | 部分一致 0 件 | 中断 | `'認証' に一致するタスクがありません。'task list' で一覧を確認してください` |
+| 候補が複数 | `Ambiguous` | 部分一致 2 件以上 | 中断・候補を番号付きで提示 | `'API' に複数のタスクが一致します:\n  1 認証API実装\n  4 API仕様レビュー\n番号で指定してください` |
+| 計測していない | `NotMeasuring` | `stop` / `note` を非計測時に実行 | 中断・状態を変えない | `計測していません。'start <番号\|名前>' で開始してください` |
+| resume 対象なし | `NoResumeTarget` | 確定エントリが 1 件も存在しない | 中断 | `再開できるエントリがありません。'start <番号\|名前>' で開始してください` |
+| 計測中の終了要求 | —（REPL レイヤーの制御） | `exit` / Ctrl-D を計測中に実行 | **終了を中止**しループ継続 | `認証API実装 を計測中です。'stop' で終了してから exit してください` |
+| 計測中タスクのアーカイブ | `TaskInUse` | `task archive` の対象が計測中 | 中断 | `計測中のタスクはアーカイブできません。'stop' してから実行してください` |
+| 時刻の前後関係が不正 | `InvalidTimeRange` | `add` / `edit` / 復帰入力で 終了 < 開始 | 中断・再入力を促す | `終了時刻(09:00)が開始時刻(10:00)より前です。開始時刻より後の時刻を指定してください` |
+| 時間帯の重複 | —（警告） | `add` の時間帯が既存エントリと重なる | **警告のうえ実行** | `警告: 10:00-11:00 は既存エントリ(定例MTG)と重複しています。追加しました` |
+| JSONL の行破損 | —（警告） | 読み込み時に JSON パース失敗 | **該当行のみスキップ**して継続 | `警告: 2026-08.jsonl の 12 行目を読み飛ばしました(不正なJSON)` |
+| マスタ解決失敗 | —（警告） | エントリの ID に対応するマスタがない | スナップショット名で表示・継続 | `警告: 一部のエントリでプロジェクト/タスクが見つかりません。記録時の名前で表示しています` |
+| current.json 破損 | —（ストア層の `CorruptedError`） | 起動時のパース失敗 | 内容提示・破棄を確認 | `current.json が破損しています。内容: ... 破棄して起動しますか? (y/N)` |
+| projects.json 破損 | —（ストア層の `CorruptedError`） | 起動時のパース失敗 | **起動を中止** | `projects.json が破損しています。~/.timelog/projects.json を修正するか、退避してから再起動してください` |
+| 出力先が存在しない | `ExportPathNotFound` | `export --out` の親ディレクトリがない | 中断 | `出力先ディレクトリ '/foo/bar' が存在しません。作成してから再実行してください` |
+| 出力先が既存 | —（確認プロンプト） | `export` 先のファイルが既に存在 | 上書き確認 | `timelog-2026-08.csv は既に存在します。上書きしますか? (y/N)` |
+| 未知のコマンド | —（REPL レイヤーの `ParseError`） | ルーティング失敗 | 中断 | `不明なコマンドです: 'strat'。'help' でコマンド一覧を確認できます` |
+| 予期しない例外 | —（想定外） | 上記以外 | **ループを継続**しスタックを表示 | `予期しないエラーが発生しました: <message>\n記録は保存されています。続行できます` |
 
 **`projects.json` の破損だけ起動を中止する理由**: マスタが読めない状態で操作を続けると、
 新規登録によってマスタを空の状態から上書きし、既存の ID 体系を失う危険がある。
 一方 `current.json` は失っても影響が計測中の 1 件に限られるため、破棄を選べる形にしている。
 
 ## テスト戦略
+
+**カバレッジ目標**: 80%（branches / functions / lines / statements）。`vitest.config.ts` に設定済みの
+閾値をそのまま用いる。`src/domain/` は副作用を持たず分岐も追いやすいため、実質 100% を目標とする
+（閾値の詳細は `docs/architecture.md`、方針は `docs/development-guidelines.md` を参照）。
 
 ### ユニットテスト
 
@@ -1132,6 +1329,7 @@ ANSI エスケープを直接使用し、`process.stdout.isTTY` が false の場
 | 異常終了からの復帰 | `current.json` を残した状態で起動し、終了時刻の入力・不正入力の再入力・中断時の保持が仕様どおり動くこと |
 | プロンプト表示 | 各状態でプロンプト文字列が期待どおりであること |
 | エラーメッセージ | 上表のエラー種別ごとに、想定した文言が出力されること |
+| 打鍵コスト | タスク登録済みの状態で、`start` / `stop` が**タスク名を打たずに 8 打鍵以内**（Enter を含む）で完了すること。シナリオ内で入力文字列長を assert する（`stop` + Enter = 5、`start 3` + Enter = 8。タスクが 2 桁の番号でも `start 12` + Enter = 9 となるため、**タスク一覧が 10 件を超える場合は要件を満たせない**点を既知の制約として記録する） |
 
 ### 性能テスト
 
@@ -1140,3 +1338,4 @@ ANSI エスケープを直接使用し、`process.stdout.isTTY` が false の場
 - 1,000 エントリの月別ファイルに対する `show` が 100ms 以内
 - プロジェクト 100 / タスク 1,000 の `projects.json` で起動が 500ms 以内、`task list` が 100ms 以内
 - 1,000 エントリの `export` が 1 秒以内
+- 作業切り替え（`stop` → `start <番号>`）の**処理時間の合計が 200ms 以内**。PRD の「1 エントリの記録に要する時間 5 秒以内」に対応する。この 5 秒は人間の打鍵時間を含む指標であり自動計測できないため、**ツール側の処理時間が 5 秒の予算に対して無視できる範囲であること**を回帰的に検証する形に落とす

@@ -805,8 +805,16 @@ stateDiagram-v2
 | `Ambiguous` | 名前の部分一致が 2 件以上 | 候補を番号付きで提示 |
 | `NotMeasuring` | 非計測時の `stop` / `note` | `計測していません。'start <番号\|名前>' で開始してください` |
 | `NoResumeTarget` | 確定エントリが 0 件での `resume` | `再開できるエントリがありません。...` |
+| `TaskInUse` | 計測中のタスクに対する `task archive` | `計測中のタスクはアーカイブできません。'stop' してから実行してください` |
 | `InvalidTimeRange` | 終了時刻 < 開始時刻 | `終了時刻(09:00)が開始時刻(10:00)より前です。...` |
 | `InvalidName` | 名前の長さ違反 / 制御文字 | `タスク名は 1〜100 文字で指定してください` |
+| `ExportPathNotFound` | `export --out` の親ディレクトリが存在しない | `出力先ディレクトリ '/foo/bar' が存在しません。作成してから再実行してください` |
+
+**`AppError` に含まれないもの**: 警告（時間帯の重複、JSONL の行破損、マスタ解決失敗）、確認プロンプト
+（`export` 先の上書き）、REPL レイヤーの制御（計測中の `exit`、未知のコマンドの `ParseError`）、
+ストア層の例外（`current.json` / `projects.json` の破損による `CorruptedError`）。いずれも
+処理を中断する想定内エラーではないか、サービスレイヤーの `Result` を経由しないため。
+全 21 種の対応関係は `docs/functional-design.md` のエラーハンドリング表を参照。
 
 **対処方法**:
 - ユーザー: メッセージ末尾に示されたコマンドを実行する
