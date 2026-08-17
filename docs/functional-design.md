@@ -292,7 +292,9 @@ class ReplSession {
 
   /**
    * 起動時の復帰フロー。current.json があれば終了時刻を尋ねて確定する。
-   * 突入時点で TimerService.recordRecoveryStarted() を呼び、発火を1件記録する
+   * 突入時点で TimerService.recordRecoveryStarted() を呼び、発火を1件記録する。
+   * フロー本体は src/repl/recoverTimer.ts に持ち、本メソッドはそこへ委譲する
+   * (run() における呼び出し順序の制御だけが ReplSession の責務)
    */
   private recoverIfNeeded(): Promise<void>;
 

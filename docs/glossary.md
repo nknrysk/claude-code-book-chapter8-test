@@ -349,9 +349,11 @@ Crockford Base32（`i` `l` `o` `u` を除いた 32 文字）の 6 文字に、`p
 開始時刻より前の時刻が入力された場合は再入力を求める。
 入力を中断した場合は `current.json` を保持したまま起動する（記録を失わないため）。
 
-**関連用語**: [計測中の状態](#計測中の状態)、[終了フロー](#終了フロー)
+突入した時点で発動が 1 件記録される（[RecoveryEvent / RecoveryLogStore](#recoveryevent--recoverylogstore) を参照）。
 
-**実装箇所**: `src/repl/recoverTimer.ts`
+**関連用語**: [計測中の状態](#計測中の状態)、[終了フロー](#終了フロー)、[RecoveryEvent / RecoveryLogStore](#recoveryevent--recoverylogstore)
+
+**実装箇所**: `src/repl/recoverTimer.ts`（`ReplSession.recoverIfNeeded()` から委譲される）
 
 ---
 
@@ -787,6 +789,36 @@ stateDiagram-v2
 
 ---
 
+### RecoveryEvent / RecoveryLogStore
+
+**定義**: [復帰フロー](#復帰フロー)の発動を 1 件記録するデータ構造（`RecoveryEvent`）と、
+その記録を `~/.timelog/recovery.jsonl` へ追記・集計するストア（`RecoveryLogStore`）
+
+**説明**:
+PRD のセカンダリー KPI「復帰導線の発火率（月 1 回以下）」を測定するための記録。
+記録するのは復帰フローに**突入した時点**であり、ユーザーが確定をキャンセルした場合も 1 件と数える。
+KPI が測るのは確定の成否ではなく異常終了の頻度であるため。
+追記の失敗は復帰フローを中断させない（KPI 計測用の副次的な記録が、ユーザーのデータ確定を妨げない）。
+
+**主要フィールド**（`RecoveryEvent`）:
+- `at`: 復帰処理が発動した日時。**これ以外のフィールドを持たない**
+
+**主なメソッド**（`RecoveryLogStore`）:
+- `append(event)`: 1 行追記する
+- `countInMonth(month)`: 指定月の発生回数を数える（月次の KPI 集計用）
+
+**制約**: [timelog](#timelog) は作業内容を外部に出さない方針を採り、標準出力以外へのログ出力を行わない。
+このストアが例外として認められるのは、タイムスタンプのみを持ち
+タスク名・プロジェクト名・[備考](#備考)を一切含まないという一点による。
+**将来もフィールドを増やさない**こと。増やした時点でこの前提が崩れる。
+
+**関連用語**: [復帰フロー](#復帰フロー)、[JSONL](#jsonl)、[計測中の状態](#計測中の状態)
+
+**実装箇所**: `src/stores/RecoveryLogStore.ts`（`src/repl/recoverTimer.ts` から
+`TimerService.recordRecoveryStarted()` 経由で呼ばれる）
+
+---
+
 ## エラー・例外
 
 ### AppError
@@ -989,6 +1021,7 @@ throw new DataCorruptedError(
 - [Entry](#entry) — データモデル
 - [JSONL](#jsonl) — 技術用語
 - [Project](#project) — データモデル
+- [RecoveryEvent / RecoveryLogStore](#recoveryevent--recoverylogstore) — データモデル
 - [Task](#task) — データモデル
 - [Vitest](#vitest) — 技術用語
 - [時刻の注入](#時刻の注入) — アーキテクチャ用語
@@ -999,3 +1032,5 @@ throw new DataCorruptedError(
 | 日付 | 変更内容 |
 |------|---------|
 | 2026-08-12 | 初版作成。PRD・機能設計書・技術仕様書・リポジトリ構造定義書・開発ガイドラインから用語を抽出 |
+| 2026-08-17 | `AppError.kind` に `TaskInUse` / `ExportPathNotFound` を追加、`AppError` に含まれないものの説明を追加（機能設計書レビュー対応） |
+| 2026-08-17 | `RecoveryEvent` / `RecoveryLogStore` を追加、「復帰フロー」から相互参照（リポジトリ構造定義書レビュー対応） |

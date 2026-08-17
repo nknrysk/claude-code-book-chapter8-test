@@ -97,6 +97,13 @@ src/repl/
 `domain/` への直接依存も禁止する。ハンドラが日跨ぎ分割や集計を直接呼べてしまうと、
 「サービスを通さない経路」が生まれ、永続化を伴う処理の入口が二重になるため。
 
+**`recoverTimer.ts` の位置づけ**: **初期実装から独立ファイルとして作る**（行数が増えてから
+切り出すのではない）。`docs/functional-design.md` の `ReplSession.recoverIfNeeded()` は
+このファイルの関数へ**委譲する** private メソッドであり、復帰フロー本体を持たない。
+`ReplSession` 側にメソッドを残すのは、`run()` の中での呼び出し順序（復帰 → 入力ループ）が
+`ReplSession` の責務だからであり、終了時刻を対話的に尋ねるフロー自体は
+起動シーケンスから独立して読めるべきものだからである。
+
 **ハンドラの責務境界**: ハンドラは「引数の検証 → サービス呼び出し → 結果の整形」のみを行う。
 条件分岐によるビジネスルールの実装（どのタスクが選ばれるか、何分になるか）を持たない。
 
@@ -130,6 +137,7 @@ TimerService ──▶ ProjectService ──▶ ProjectStore
      ▼                  │
 EntryStore        NameResolver ──▶ ReportService / ExportService が利用
 CurrentStore
+RecoveryLogStore
 ```
 
 `TimerService → ProjectService` は許可する（`start` 成功時の `lastUsedAt` 更新のため）。
@@ -164,16 +172,20 @@ src/domain/
 
 **依存関係**:
 
-- 依存可能: `types/` のみ
-- 依存禁止: **それ以外のすべて**（`node:fs`、`node:crypto` 以外の Node 標準モジュールも含む）
+- 依存可能: `types/`、`formatters/`（純粋関数のみ。`buildEntries.ts` が永続化フォーマットの
+  生成に `formatIsoLocal.ts` を使うため。詳細は後述の `formatters/` の節を参照）
+- 依存禁止: **それ以外のすべて**。`node:fs` をはじめとする Node 標準モジュールも禁止する
+  （唯一の例外は `generateId.ts` の `node:crypto`。下記参照）
 
 **`services/` と分けている理由**: 本プロダクトで最も壊れやすいのは日跨ぎ分割と
 タスク解決であり、いずれも入力と出力が決まれば正しさが定義できる純粋な計算である。
 これを I/O を持つサービスから物理的に分離することで、**テストがファイルシステムも
 時刻モックも必要としない**状態を構造的に保証する。
 
-`generateId.ts` のみ `node:crypto` の `randomBytes` を使うが、乱数源は引数で
-差し替え可能にし、テストでは決定的な値を注入する。
+**Node 標準モジュール禁止の唯一の例外**: `generateId.ts` のみ `node:crypto` の `randomBytes` を
+使う。ただし乱数源は引数で差し替え可能にし、テストでは決定的な値を注入する。
+差し替え可能であることが例外を許す条件であり、これ以外のファイルで Node 標準モジュールを
+import しない。とくに `node:fs` を使うのは `stores/` だけであり、`domain/` からは触れない。
 
 ### src/stores/ (データレイヤー)
 
@@ -186,6 +198,7 @@ src/stores/
 ├── ProjectStore.ts          # projects.json の読み書き
 ├── EntryStore.ts            # entries/YYYY-MM.jsonl の読み書き・追記
 ├── CurrentStore.ts          # current.json の読み書き・削除
+├── RecoveryLogStore.ts      # recovery.jsonl の追記・月次カウント(復帰導線 KPI 用)
 ├── atomicWrite.ts           # 一時ファイル + rename による原子的書き込み
 └── paths.ts                 # ~/.timelog 配下のパス解決(TIMELOG_HOME に対応)
 ```
@@ -200,6 +213,13 @@ src/stores/
 **業務ルールを持たない**: 日跨ぎ分割、集計、並び替え、名前解決を行わない。
 `EntryStore.append(entries)` は「渡されたエントリを月ごとに振り分けて追記する」だけであり、
 なぜ複数件になっているか（日跨ぎ分割の結果か）を知らない。
+
+**`RecoveryLogStore` の制約**: PRD のセカンダリー KPI「復帰導線の発火率」を測るための記録であり、
+`TimerService.recordRecoveryStarted()` から呼ばれる。`recovery.jsonl` が持つのは
+**発動時刻（`at`）のみ**で、タスク名・プロジェクト名・備考を一切含まない。
+`docs/architecture.md` のログ非出力方針は「作業内容を含むため」を理由とするものであり、
+このストアが例外として成立するのは作業内容を持たないというこの一点による。
+**将来もフィールドを増やさない**こと（設計の詳細は `docs/functional-design.md` を参照）。
 
 **`paths.ts` の役割**: データディレクトリの位置を決める唯一の場所。
 `TIMELOG_HOME` 環境変数があればそれを、なければ `os.homedir()/.timelog` を返す。
@@ -305,6 +325,7 @@ tests/
 │   ├── day-split-persistence.test.ts  # 日跨ぎ・月跨ぎの振り分け
 │   ├── corrupted-data.test.ts     # 破損行のスキップ・マスタ欠損時のフォールバック
 │   ├── atomic-write.test.ts       # 書き込み中断時にファイルが壊れないこと
+│   ├── recovery-log.test.ts       # recovery.jsonl の追記・月次カウントの月境界
 │   └── permissions.test.ts        # 700 / 600 の確認
 ├── e2e/                           # REPL を起動したシナリオ検証
 │   ├── first-run.test.ts          # 初回セットアップの最短経路
@@ -328,21 +349,34 @@ tests/
 **ユニットテストだけ `src/` と同じ構造を保つ理由**: 対象ファイルと 1 対 1 に対応するため。
 統合・E2E は複数のコンポーネントを横断するので、シナリオ名で並べる方が探しやすい。
 
+**`tests/unit/` に `stores/` を作らない**: ストアはファイル I/O が本体であり、
+モックした時点で検証対象がなくなる。実ファイルに対して検証する `tests/integration/` に置く
+（`corrupted-data` / `atomic-write` / `recovery-log` / `permissions` がこれにあたる）。
+`recovery-log.test.ts` を `e2e/exit-and-recovery.test.ts` と別に持つのは、後者が
+シナリオの通しを見るのに対し、前者は `countInMonth` の月境界のように
+シナリオでは踏みにくい入力を直接与えるためである。
+
 **`src/` 内にテストを置かない**: `vitest.config.ts` は `src/**/*.test.ts` も対象に含む設定だが、
 本プロジェクトではテストを `tests/` に集約する。ビルド対象（`tsconfig.json` の `include: ["src/**/*"]`）
 からテストを除外する必要があり、共置するとビルド成果物にテストが混入するため。
 
 ### docs/ (ドキュメントディレクトリ)
 
-| ファイル | 内容 |
-|---------|------|
-| `product-requirements.md` | プロダクト要求定義書 |
-| `functional-design.md` | 機能設計書 |
-| `architecture.md` | 技術仕様書 |
-| `repository-structure.md` | 本ドキュメント |
-| `development-guidelines.md` | 開発ガイドライン |
-| `glossary.md` | 用語集 |
-| `ideas/time-tracking-cli.md` | 壁打ちメモ（PRD の出典） |
+| ファイル | 内容 | 更新トリガー |
+|---------|------|-------------|
+| `product-requirements.md` | プロダクト要求定義書 | 解決する課題・KPI・スコープ（P0/P1/P2）が変わったとき |
+| `functional-design.md` | 機能設計書 | コマンドの仕様、クラス・メソッドのシグネチャ、エラー種別が変わったとき |
+| `architecture.md` | 技術仕様書 | レイヤー構成、データの保存形式・保存先、非機能要件が変わったとき |
+| `repository-structure.md` | 本ドキュメント | ディレクトリ・主要ファイルの追加削除、依存関係のルールが変わったとき |
+| `development-guidelines.md` | 開発ガイドライン | コーディング規約、レビュー基準、開発フローが変わったとき |
+| `glossary.md` | 用語集 | 新しいドメイン用語・データモデル・`AppError.kind` が増えたとき |
+| `ideas/time-tracking-cli.md` | 壁打ちメモ（PRD の出典） | 更新しない（作成時点の記録として残す） |
+
+**更新トリガーを表に持つ理由**: 実装中に設計と実際の構造が食い違ったとき、
+`docs/development-guidelines.md` の「ドキュメントと実装が食い違った場合」の指針と
+この列を突き合わせれば、どの文書を直すかを迷わず引ける。
+1 つの変更が複数行に該当することもある（例: 新しいストアの追加は
+`functional-design.md`・本書・`glossary.md` の 3 つに該当する）。
 
 ## ファイル配置規則
 
@@ -510,7 +544,7 @@ ESLint の `import/no-cycle` 相当のルールを導入するか、
 
 **分割が想定されるファイル**:
 
-- `ReplSession.ts` — 起動 / 復帰 / ループ / 終了の 4 フローを持つ。300 行を超えたら復帰フロー（`recoverTimer.ts`）に続いて起動シーケンスも切り出す
+- `ReplSession.ts` — 復帰フローは初期実装の時点で `recoverTimer.ts` に分離済み。残る起動 / ループ / 終了の 3 フローで 300 行を超えたら、次は起動シーケンスを切り出す
 - `TimerService.ts` — `start` の自動 stop 分岐を含むため肥大しやすい。純粋計算は `domain/` へ寄せることで抑える
 - `handlers/timerHandler.ts` — 4 コマンドを 1 ファイルに置いている。コマンドごとの分岐が増えたら分割する
 
