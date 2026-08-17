@@ -454,7 +454,7 @@ Closes #12
 - [ ] `npm run typecheck` がパス
 - [ ] `npm run lint` がパス
 - [ ] `npm run test:coverage` がパス（閾値 80%）
-- [ ] `npm run build && node dist/index.js --version` が起動する
+- [ ] `npm run build && printf 'exit\n' | TIMELOG_HOME="$(mktemp -d)" node dist/index.js` が正常終了する
 - [ ] `package.json` の `dependencies` が空のまま
 - [ ] 冒頭の「プロジェクト固有の必須ルール」6 点に違反していない
 
@@ -768,7 +768,7 @@ CI が未構築のため、当面は PR 作成者が手元で実行する。CI �
 npm run typecheck
 npm run lint
 npm run test:coverage
-npm run build && node dist/index.js --version   # 実行時エラーの検出
+npm run build && printf 'exit\n' | TIMELOG_HOME="$(mktemp -d)" node dist/index.js   # 実行時エラーの検出
 node -e "process.exit(Object.keys(require('./package.json').dependencies ?? {}).length)"  # 実行時依存ゼロの確認
 ```
 

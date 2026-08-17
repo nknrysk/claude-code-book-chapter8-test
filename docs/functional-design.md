@@ -92,7 +92,7 @@ graph TB
 | 分類 | 技術 | 選定理由 |
 |------|------|----------|
 | 言語 | TypeScript 5.3 | データモデルを型で固定する。エントリのID/名前二重保持のような構造は型がないと崩れやすい |
-| ランタイム | Node.js v24.11.0 (ESM) | 既存の devcontainer 環境に合わせる。`package.json` は `"type": "module"` 済み |
+| ランタイム | Node.js v24.19.0 (ESM) | 既存の devcontainer 環境に合わせる。`package.json` は `"type": "module"` 済み |
 | REPL | `node:readline/promises` (標準) | 非機能要件「起動 500ms 以内」に対し、外部依存を持たないことが最も確実。プロンプト文字列の動的差し替えにも対応できる |
 | コマンド解析 | 自前実装 | コマンド体系が REPL 内の独自文法（`start 3 備考テキスト` のように末尾を自由テキストとして扱う）であり、Commander 等の CLI パーサとは適合しない |
 | 永続化 | `node:fs/promises` + JSON / JSONL | ローカル完結・単一ユーザーのため DB は過剰。JSONL は追記が O(1) で、`grep` 可能という PRD の要件にも合う |
@@ -100,8 +100,8 @@ graph TB
 | テスト | Vitest 2.x | 既存構成をそのまま使用 |
 | 静的解析 | ESLint 9 + Prettier 3 | 既存構成をそのまま使用 |
 
-> **Node.js のバージョン表記について**: `CLAUDE.md` には v24.11.0 と記載があるが、devcontainer の
-> 実測は v24.19.0（`docs/architecture.md` を参照）。いずれも v24 系のため本設計に影響はない。
+> **Node.js のバージョン表記について**: 主表記は devcontainer の実測値 v24.19.0 とし、`docs/architecture.md` と揃える。
+> `CLAUDE.md` には v24.11.0 と記載があるが、いずれも v24 系のため本設計に影響はない。
 > `package.json` の `engines` には `">=24.0.0"` を指定する。
 
 **外部依存を追加しない方針**とする。カラー出力も ANSI エスケープを直接扱う薄いラッパで済ませる。

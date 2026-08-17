@@ -105,37 +105,54 @@ API シグネチャを正しく検査できない。`^24.0.0` へ更新する。
 
 ```
 ┌──────────────────────────────────────────────┐
-│  REPL レイヤー                                │ ← 入力ループ・プロンプト・表示整形
+│  REPL レイヤー                               │ ← 入力ループ・プロンプト・表示整形
 │  ReplSession / PromptRenderer /              │
 │  CommandRouter / CommandHandlers /           │
 │  OutputFormatter                             │
 ├──────────────────────────────────────────────┤
-│  サービスレイヤー                              │ ← ビジネスロジック
-│  ProjectService / TimerService /              │
-│  ReportService / ExportService / NameResolver │
+│  サービスレイヤー                            │ ← ビジネスロジック
+│  ProjectService / TimerService /             │
+│  ReportService / ExportService / NameResolver│
 ├──────────────────────────────────────────────┤
-│  データレイヤー                                │ ← 永続化
-│  ProjectStore / EntryStore / CurrentStore /   │
-│  atomicWrite                                  │
+│  純粋ロジックレイヤー (domain)               │ ← 副作用のない計算
+│  splitByDay / buildEntries / resolveTask /   │
+│  byRecency / generateId / summarize / toCsv  │
+├──────────────────────────────────────────────┤
+│  データレイヤー                              │ ← 永続化
+│  ProjectStore / EntryStore / CurrentStore /  │
+│  RecoveryLogStore / atomicWrite              │
 └──────────────────────────────────────────────┘
                      ↓
               ~/.timelog/
 ```
 
+依存方向は一方向（REPL → サービス → 純粋ロジック / データ）。
+純粋ロジックレイヤーは副作用を持たないため、サービスレイヤーとデータレイヤーの
+いずれからも独立してテストできる。
+
 #### REPL レイヤー
 
 - **責務**: 入力の受付とパース、コマンドのルーティング、結果の表示整形、終了・復帰フローの制御
 - **許可される操作**: サービスレイヤーの呼び出し、`ReplIo` を介した入出力
-- **禁止される操作**: データレイヤーへの直接アクセス、`~/.timelog` のパスを知ること
+- **禁止される操作**: データレイヤー・純粋ロジックレイヤーへの直接アクセス（サービスを迂回する経路を作らないため）、`~/.timelog` のパスを知ること
 
 #### サービスレイヤー
 
-- **責務**: ビジネスロジック（日跨ぎ分割、タスク解決、ID 採番、集計、名前解決）の実装
-- **許可される操作**: データレイヤーの呼び出し、他サービスの呼び出し
+- **責務**: 永続化を伴うビジネス処理の調整。純粋ロジックレイヤーの関数とデータレイヤーを組み合わせる
+- **許可される操作**: 純粋ロジックレイヤーの呼び出し、データレイヤーの呼び出し、他サービスの呼び出し
 - **禁止される操作**:
   - `console.*` の直接呼び出し、`readline` への依存
   - 例外による制御フロー（`Result<T, E>` を返す。詳細は後述）
   - **`new Date()` の直接呼び出し**（現在時刻は引数で受け取る）
+
+#### 純粋ロジックレイヤー (domain)
+
+- **責務**: 副作用を持たない業務ルールの計算（日跨ぎ分割、タスク解決、ID 採番、集計、CSV 生成）
+- **許可される操作**: 引数として渡された値のみを使った計算
+- **禁止される操作**: ファイル I/O、現在時刻の取得（`new Date()`）、コンソール出力、上位レイヤーへの依存
+
+ファイルシステムや時刻のモックなしに単体テストできることが、このレイヤーを分離する目的である。
+配置とファイル名は `docs/repository-structure.md` の `src/domain/` を正とする。
 
 #### データレイヤー
 
@@ -254,7 +271,7 @@ PRD にはバックアップの明示的な要件がないが、非機能要件�
 | `task list` / `project list` | 100ms 以内 | タスク 200 件 | 整列（キャッシュヒット時は表示整形のみ） |
 | `show` | 100ms 以内 | 1 日 50 件 / 月 1,000 件 | 月ファイルの全行パース |
 | `export` | 1 秒以内 | 月 1,000 件 | 月ファイルのパース + CSV 生成 |
-| プロンプト再描画 | 体感遅延なし | — | 経過時間の再計算のみ（O(1)） |
+| プロンプト再描画 | 100ms 以内（コマンド確定から次のプロンプト表示まで） | — | 経過時間の再計算のみ（O(1)） |
 
 **律速の見立て**: 最も重いのは `show` / `export` における月ファイルの全行 JSON パースである。
 1,000 行 × 約 250 バイト = 約 250KB。`JSON.parse` を 1,000 回呼んでも数 ms 台であり、
@@ -342,7 +359,7 @@ PRD にはバックアップの明示的な要件がないが、非機能要件�
 ### ユニットテスト
 
 - **フレームワーク**: Vitest 2.x
-- **対象**: サービスレイヤーの純粋ロジックと、REPL レイヤーの整形処理
+- **対象**: 純粋ロジックレイヤー（`src/domain/`）と、REPL レイヤーの整形処理
   - `splitByDay` / `buildEntries` / `truncateToMinute` / `formatIsoLocal`
   - `resolveTask` / `byRecency` / `generateId` / `summarize`
   - `escapeCsvField` / `PromptRenderer.render` / `CommandRouter.parse`
@@ -443,5 +460,10 @@ PRD の想定利用環境が devcontainer であるため、実害はない。
 | 型検査 | `npm run typecheck` | — |
 | 静的解析 | `npm run lint` | — |
 | テスト + カバレッジ | `npm run test:coverage` | 閾値 80% の維持 |
-| ビルドと起動確認 | `npm run build && node dist/index.js --version` | `moduleResolution` の不整合など、Vitest では検出できない実行時エラーの検出 |
+| ビルドと起動確認 | `npm run build && printf 'exit\n' \| TIMELOG_HOME="$(mktemp -d)" node dist/index.js` | `moduleResolution` の不整合など、Vitest では検出できない実行時エラーの検出 |
 | 実行時依存ゼロの検査 | `node -e "process.exit(Object.keys(require('./package.json').dependencies ?? {}).length)"` | 実行時依存が追加されていないことの保証 |
+
+**起動確認コマンドについて**: CLI にバージョン表示などの非対話フラグは持たせない（PRD・機能設計書のいずれにも定義がない）。
+代わりに、仕様済みの `exit` コマンドを標準入力から流し込んで正常終了（終了コード 0）することを確認する。
+`TIMELOG_HOME` を一時ディレクトリに向けるのは、CI 実行者のホームに `~/.timelog/` を作らないためである。
+この検査が成立する前提として、**標準入力が TTY でない場合も REPL が起動し、EOF で正常終了すること**を実装要件とする。
