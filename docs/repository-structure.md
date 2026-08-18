@@ -1,6 +1,7 @@
 # リポジトリ構造定義書 (Repository Structure Document)
 
 作成日: 2026-08-12
+更新日: 2026-08-18
 対象: `docs/architecture.md` で定義したレイヤードアーキテクチャの物理配置
 
 ## プロジェクト構造
@@ -70,6 +71,8 @@ src/repl/
 ├── PromptRenderer.ts        # 状態表示プロンプトの組み立て
 ├── CommandRouter.ts         # 入力行のパースとハンドラへのディスパッチ
 ├── OutputFormatter.ts       # 成功・警告・エラーメッセージの整形
+├── commandSpecs.ts          # COMMAND_SPECS(ディスパッチと help の唯一の情報源)
+├── commandContext.ts        # ハンドラに渡す実行文脈と戻り値の型
 ├── recoverTimer.ts          # 起動時の復帰フロー(終了時刻の対話入力)
 └── handlers/                # コマンドごとの入出力
     ├── projectHandler.ts    # project add / list / archive
@@ -200,6 +203,8 @@ src/stores/
 ├── CurrentStore.ts          # current.json の読み書き・削除
 ├── RecoveryLogStore.ts      # recovery.jsonl の追記・月次カウント(復帰導線 KPI 用)
 ├── atomicWrite.ts           # 一時ファイル + rename による原子的書き込み
+├── ensureDataDir.ts         # データディレクトリの生成(0o700)
+├── fsErrors.ts              # ENOENT 判定(「存在しない = 未初期化」を正常系として扱う)
 └── paths.ts                 # ~/.timelog 配下のパス解決(TIMELOG_HOME に対応)
 ```
 
@@ -623,3 +628,11 @@ OS の一時領域に作るため、リポジトリを汚さない。
 | `tsconfig.json` | `module` / `moduleResolution` を `NodeNext` へ変更 | `docs/architecture.md` の「既存設定に必要な変更」を参照 |
 | `package.json` | `name` を `timelog` に変更、`bin` / `engines` / `files` を追加、`@types/node` を `^24.0.0` へ | 同上 |
 | `README.md` | timelog の概要・インストール・使い方に差し替え | テンプレートの説明のままになっている |
+
+## 変更履歴
+
+| 日付       | 変更内容                                                                                                                                                              |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-08-12 | 初版作成                                                                                                                                                                |
+| 2026-08-17 | レビュー指摘 5 項目を反映                                                                                                                                               |
+| 2026-08-18 | MVP(P0) 実装に伴う追加ファイルを反映。`src/stores/` に `ensureDataDir.ts` / `fsErrors.ts`、`src/repl/` に `commandSpecs.ts` / `commandContext.ts` を追記 |

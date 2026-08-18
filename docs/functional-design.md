@@ -1,6 +1,7 @@
 # 機能設計書 (Functional Design Document)
 
 作成日: 2026-08-12
+更新日: 2026-08-18
 対象: `docs/product-requirements.md`（承認済み）
 スコープ: P0(MVP) を中心に設計し、P1 機能は拡張点として構造のみ確保する
 
@@ -283,8 +284,9 @@ class ReplSession {
     projectService: ProjectService;
     timerService: TimerService;
     reportService: ReportService;
-    exportService: ExportService;
+    exportService: ExportService;  // P1(export 実装時に追加する)
     io: ReplIo;                    // readline のラッパ。テスト時は差し替える
+    clock?: () => Date;            // 現在時刻の供給元。テスト時は固定する
   });
 
   /** 起動から終了までを実行する */
@@ -300,6 +302,14 @@ class ReplSession {
 
   /** 終了要求の処理。計測中なら false を返してループを継続する */
   private handleExit(): Promise<boolean>;
+
+  /**
+   * 入力の終端(Ctrl-D / パイプの終わり)の処理。
+   * 計測中は exit と同じく終了を中止するが、入力が連続して終端に達した場合は
+   * 二度と入力が来ないため警告して終了する(中止し続けると無限ループになる)。
+   * current.json は保持されるため、次回起動時の復帰フローで確定できる
+   */
+  private handleEndOfInput(): Promise<boolean>;
 }
 
 interface ReplIo {
@@ -428,13 +438,14 @@ class HelpHandler {
 
 ```typescript
 class ProjectService {
-  addProject(name: string): Promise<Result<Project>>;
+  /** createdAt に用いる現在時刻は引数で受け取る(規約1) */
+  addProject(name: string, now: Date): Promise<Result<Project>>;
   listProjects(includeArchived: boolean): Promise<Project[]>;
   archiveProject(name: string): Promise<Result<Project>>;
   findProjectById(projectId: ProjectId): Promise<Project | null>;
   findProjectByName(name: string): Promise<Project | null>;
 
-  addTask(projectId: ProjectId, name: string): Promise<Result<Task>>;
+  addTask(projectId: ProjectId, name: string, now: Date): Promise<Result<Task>>;
   /** 最近使った順に整列した非アーカイブタスク。表示連番はこの配列の添字+1 */
   listTasks(projectId: ProjectId, includeArchived: boolean): Promise<Task[]>;
   archiveTask(projectId: ProjectId, taskId: TaskId): Promise<Result<Task>>;
@@ -469,12 +480,21 @@ type ResolveError =
 **インターフェース**:
 
 ```typescript
+/** start / resume の結果。自動確定したエントリと、表示すべき警告を伴う */
+interface StartResult {
+  started: CurrentTimer;
+  /** 計測中に start した場合、自動的に確定されたエントリ */
+  autoStopped?: Entry[];
+  /** 他プロセスが開始した計測を確定した場合の警告(多重起動の検知) */
+  warnings: string[];
+}
+
 class TimerService {
   getCurrent(): Promise<CurrentTimer | null>;
 
   /** 計測中の場合は自動で stop してから開始する */
   start(projectId: ProjectId, taskId: TaskId, note: string | undefined, now: Date)
-    : Promise<Result<{ started: CurrentTimer; autoStopped?: Entry[] }>>;
+    : Promise<Result<StartResult>>;
 
   /** 計測を終了し、日跨ぎ分割後のエントリ群を返す */
   stop(now: Date): Promise<Result<Entry[]>>;
@@ -484,7 +504,7 @@ class TimerService {
    * 引き継ぐのはタスクのみで、**備考は引き継がない**（同じ作業の続きでも
    * 内容は変わるため。必要なら `note` で改めて設定する）
    */
-  resume(now: Date): Promise<Result<CurrentTimer>>;
+  resume(now: Date): Promise<Result<StartResult>>;
 
   /** 計測中エントリの備考を上書きする */
   setNote(text: string): Promise<Result<CurrentTimer>>;
@@ -497,6 +517,12 @@ class TimerService {
    * 確定の成否に関わらず、フロー突入時に1度だけ呼ぶ
    */
   recordRecoveryStarted(now: Date): Promise<void>;
+
+  /**
+   * 復帰フロー用。破損した current.json を破棄する。
+   * 失っても影響は計測中の 1 件に限られるため、利用者に破棄を選ばせる
+   */
+  discardCurrent(): Promise<void>;
 
   // --- 以下 P1 ---
 
@@ -574,8 +600,14 @@ interface Subtotal {
   minutes: number;
 }
 
+/** 破損行のスキップ・スナップショットへのフォールバックを show が表示するために伴う */
+interface DailyReportResult {
+  report: DailyReport;
+  warnings: string[];
+}
+
 class ReportService {
-  daily(date: DateString): Promise<DailyReport>;
+  daily(date: DateString): Promise<DailyReportResult>;
 }
 ```
 
@@ -800,10 +832,11 @@ function buildEntries(
 **目的**: 数字なら表示連番、文字列なら名前の部分一致として解釈し、曖昧な場合は候補を提示する
 
 ```typescript
-async function resolveTask(
-  projectId: ProjectId, input: string
-): Promise<Result<Task, ResolveError>> {
-  const active = await listTasks(projectId, false);  // 最近使った順・非アーカイブのみ
+// domain/resolveTask.ts は副作用を持たないため、整列済みタスク配列を引数で受け取る。
+// ProjectService.resolveTask が listTasks(projectId, false) の結果を渡す薄いラッパになる
+function resolveTask(
+  active: readonly Task[], input: string   // active: 最近使った順・非アーカイブのみ
+): Result<Task, ResolveError> {
 
   // 数字のみ → 表示連番
   if (/^\d+$/.test(input)) {
@@ -870,10 +903,12 @@ function generateId(prefix: 'p' | 't', existing: Set<string>): string {
 ### 日次集計（タスク別小計）
 
 ```typescript
-function summarize(entries: Entry[], resolver: NameResolver): DailyReport {
-  const rows = entries
-    .sort((a, b) => a.start.localeCompare(b.start))
-    .map((entry, i) => ({ lineNo: i + 1, entry, ...resolver.resolve(entry) }));
+// 名前解決は I/O を伴うため ReportService 側で先に済ませ、domain には解決済みの行を渡す
+// (ResolvedEntry = { entry, projectName, taskName, resolvedFromSnapshot })
+function summarize(date: DateString, resolved: readonly ResolvedEntry[]): DailyReport {
+  const rows = [...resolved]
+    .sort((a, b) => a.entry.start.localeCompare(b.entry.start))
+    .map((item, i) => ({ ...item, lineNo: i + 1 }));
 
   // プロジェクトID + タスクID をキーに集約する(名前ではなくIDで束ねる)
   const map = new Map<string, Subtotal>();
@@ -1268,6 +1303,7 @@ ANSI エスケープを直接使用し、`process.stdout.isTTY` が false の場
 | 計測していない | `NotMeasuring` | `stop` / `note` を非計測時に実行 | 中断・状態を変えない | `計測していません。'start <番号\|名前>' で開始してください` |
 | resume 対象なし | `NoResumeTarget` | 確定エントリが 1 件も存在しない | 中断 | `再開できるエントリがありません。'start <番号\|名前>' で開始してください` |
 | 計測中の終了要求 | —（REPL レイヤーの制御） | `exit` / Ctrl-D を計測中に実行 | **終了を中止**しループ継続 | `認証API実装 を計測中です。'stop' で終了してから exit してください` |
+| 入力の終端が続く | —（REPL レイヤーの制御） | 計測中に入力が閉じたまま終端が連続する（パイプ実行など） | 警告して終了。`current.json` は保持し、次回起動時に復帰する | `入力が終了したため終了します。計測中の記録は保持され、次回起動時に復帰できます` |
 | 計測中タスクのアーカイブ | `TaskInUse` | `task archive` の対象が計測中 | 中断 | `計測中のタスクはアーカイブできません。'stop' してから実行してください` |
 | 時刻の前後関係が不正 | `InvalidTimeRange` | `add` / `edit` / 復帰入力で 終了 < 開始 | 中断・再入力を促す | `終了時刻(09:00)が開始時刻(10:00)より前です。開始時刻より後の時刻を指定してください` |
 | 時間帯の重複 | —（警告） | `add` の時間帯が既存エントリと重なる | **警告のうえ実行** | `警告: 10:00-11:00 は既存エントリ(定例MTG)と重複しています。追加しました` |
@@ -1341,3 +1377,11 @@ ANSI エスケープを直接使用し、`process.stdout.isTTY` が false の場
 - プロジェクト 100 / タスク 1,000 の `projects.json` で起動が 500ms 以内、`task list` が 100ms 以内
 - 1,000 エントリの `export` が 1 秒以内
 - 作業切り替え（`stop` → `start <番号>`）の**処理時間の合計が 200ms 以内**。PRD の「1 エントリの記録に要する時間 5 秒以内」に対応する。この 5 秒は人間の打鍵時間を含む指標であり自動計測できないため、**ツール側の処理時間が 5 秒の予算に対して無視できる範囲であること**を回帰的に検証する形に落とす
+
+## 変更履歴
+
+| 日付       | 変更内容                                                                                                                                                                                                                                                                                                                     |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-08-12 | 初版作成                                                                                                                                                                                                                                                                                                                     |
+| 2026-08-17 | レビュー指摘 12 項目を反映                                                                                                                                                                                                                                                                                                   |
+| 2026-08-18 | MVP(P0) 実装に伴う差分を反映。`StartResult` を追加し `TimerService.start` / `resume` の戻り値を変更、`TimerService.discardCurrent` を追加、`ReportService.daily` の戻り値を `DailyReportResult` に変更、`ProjectService.addProject` / `addTask` に `now: Date` を追加、`resolveTask` / `summarize` を純粋関数のシグネチャに修正、`ReplSession` に `clock` と `handleEndOfInput` を追加、エラー表に「入力の終端が続く」を追加 |

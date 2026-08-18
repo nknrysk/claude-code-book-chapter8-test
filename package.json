@@ -1,12 +1,22 @@
 {
-  "name": "claude-code-book-chapter8",
+  "name": "timelog",
   "version": "0.1.0",
-  "description": "Claude Code book - Chapter 8 template",
+  "description": "作業時間ログ記録 REPL ツール",
   "type": "module",
+  "bin": {
+    "timelog": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "prepare": "husky",
-    "build": "tsc",
+    "build": "tsc && chmod +x dist/index.js",
     "dev": "tsc --watch",
+    "start": "node dist/index.js",
     "lint": "eslint .",
     "format": "npx prettier --write .",
     "typecheck": "tsc --noEmit",
@@ -18,12 +28,13 @@
   "keywords": [
     "spec-driven-development",
     "claude-code",
-    "template"
+    "time-tracking",
+    "cli"
   ],
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "^20.11.0",
+    "@types/node": "^24.0.0",
     "@vitest/coverage-v8": "^2.0.0",
     "@vitest/ui": "^2.0.0",
     "eslint": "^9.0.0",
